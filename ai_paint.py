@@ -1,0 +1,546 @@
+import io
+import json
+import os
+import pickle
+import time
+
+import numpy as np
+from flask import Flask, Response, jsonify, render_template_string, request
+from PIL import Image, ImageFilter
+
+app = Flask(__name__)
+
+# ----------------------------- configuration -----------------------------
+
+DATA_FILE = "ai_state_advanced.pkl"
+SIZES = [784, 128, 64, 10]
+VAL_RATIO = 0.2
+DIGITS = list(range(10))
+
+
+# ----------------------------- data handling -----------------------------
+
+def fresh_model():
+    rng = np.random.default_rng()
+    model = {"t": 0, "m": {}, "v": {}}
+    for i, (a, b) in enumerate(zip(SIZES, SIZES[1:]), 1):
+        model[f"W{i}"] = rng.normal(0, np.sqrt(2 / a), (a, b))
+        model[f"b{i}"] = np.zeros(b)
+    return model
+
+
+def model_matches_architecture(model):
+    return all(model.get(f"W{i}", np.empty(0)).shape == (a, b) for i, (a, b) in enumerate(zip(SIZES, SIZES[1:]), 1))
+
+
+def one_hot(label):
+    y = np.zeros(10)
+    y[int(label)] = 1
+    return y
+
+
+def labels():
+    return [int(np.argmax(y)) for y in y_data]
+
+
+def load_state():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "rb") as f:
+                state = pickle.load(f)
+            state.setdefault("X", state.get("X_train", []))
+            state.setdefault("y", state.get("y_train", []))
+            if not model_matches_architecture(state.get("model", {})):
+                state["model"] = fresh_model()
+            return state
+        except Exception as e:
+            print("Starting fresh:", e)
+    return {"X": [], "y": [], "model": fresh_model()}
+
+
+state = load_state()
+X_data, y_data, model = state["X"], state["y"], state["model"]
+
+
+def save_state():
+    with open(DATA_FILE, "wb") as f:
+        pickle.dump({"X": X_data, "y": y_data, "model": model}, f)
+
+
+def dataset_stats():
+    counts = {str(d): labels().count(d) for d in DIGITS}
+    known = [d for d, n in counts.items() if n]
+    split = split_dataset()
+    warnings = []
+    if len(X_data) < 20:
+        warnings.append("Dataset has fewer than 20 examples.")
+    if len(known) == 1:
+        warnings.append(f"Model currently knows only digit {known[0]}. Accuracy is not meaningful.")
+    if len(split["val"]) == 0:
+        warnings.append("Validation set is empty.")
+    return {
+        "size": len(X_data),
+        "counts": counts,
+        "classes": known,
+        "train_size": len(split["train"]),
+        "val_size": len(split["val"]),
+        "warnings": warnings,
+    }
+
+
+def split_dataset(seed=7):
+    rng = np.random.default_rng(seed)
+    train, val = [], []
+    for digit in DIGITS:
+        ids = [i for i, label in enumerate(labels()) if label == digit]
+        rng.shuffle(ids)
+        val_count = 0 if len(ids) < 2 else max(1, round(len(ids) * VAL_RATIO))
+        val += ids[:val_count]
+        train += ids[val_count:]
+    rng.shuffle(train)
+    rng.shuffle(val)
+    return {"train": train, "val": val}
+
+
+# ------------------------ preprocessing and augmentation ------------------------
+
+def center_pixels(pixels):
+    img = np.asarray(pixels, dtype=float).reshape(28, 28)
+    if img.max() > 1:
+        img /= 255
+    ys, xs = np.where(img > 0.05)
+    if len(xs) == 0:
+        return img.ravel()
+    crop = img[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+    pil = Image.fromarray(np.uint8(crop * 255), "L")
+    scale = 20 / max(pil.size)
+    pil = pil.resize((max(1, round(pil.width * scale)), max(1, round(pil.height * scale))), Image.LANCZOS)
+    out = Image.new("L", (28, 28), 0)
+    out.paste(pil, ((28 - pil.width) // 2, (28 - pil.height) // 2))
+    return (np.asarray(out, dtype=float) / 255).ravel()
+
+
+def image_to_pixels(raw):
+    img = Image.open(io.BytesIO(raw)).convert("L").resize((28, 28), Image.LANCZOS)
+    arr = np.asarray(img, dtype=float)
+    ink = (255 - arr if arr.mean() > 127 else arr) / 255
+    ink[ink < 0.1] = 0
+    return center_pixels(ink.ravel())
+
+
+def elastic_distort(img, rng):
+    rows = np.interp(np.arange(28), np.linspace(0, 27, 5), rng.uniform(-1.5, 1.5, 5))
+    cols = np.interp(np.arange(28), np.linspace(0, 27, 5), rng.uniform(-1.5, 1.5, 5))
+    out = np.array([np.roll(row, int(round(rows[i]))) for i, row in enumerate(img)])
+    out = np.array([np.roll(out[:, j], int(round(cols[j]))) for j in range(28)]).T
+    return out
+
+
+def augment_one(row, rng):
+    img = Image.fromarray(np.uint8(row.reshape(28, 28) * 255), "L")
+    if rng.random() < 0.35:
+        img = img.filter(ImageFilter.MaxFilter(3))
+    if rng.random() < 0.20:
+        img = img.filter(ImageFilter.MinFilter(3))
+    scale = rng.uniform(0.88, 1.10)
+    size = max(18, min(28, round(28 * scale)))
+    img = img.resize((size, size), Image.LANCZOS)
+    canvas = Image.new("L", (28, 28), 0)
+    canvas.paste(img, ((28 - size) // 2 + rng.integers(-2, 3), (28 - size) // 2 + rng.integers(-2, 3)))
+    canvas = canvas.rotate(rng.uniform(-12, 12), resample=Image.BICUBIC, fillcolor=0)
+    arr = np.asarray(canvas, dtype=float) / 255
+    if rng.random() < 0.45:
+        arr = elastic_distort(arr, rng)
+    arr += rng.normal(0, 0.025, arr.shape)
+    return center_pixels(np.clip(arr, 0, 1).ravel())
+
+
+def augment_training_data(X, y, copies=2):
+    if len(X) == 0:
+        return X, y
+    rng = np.random.default_rng()
+    xs, ys = [X], [y]
+    for _ in range(copies):
+        xs.append(np.asarray([augment_one(row, rng) for row in X]))
+        ys.append(y)
+    return np.vstack(xs), np.vstack(ys)
+
+
+# ----------------------------- neural network -----------------------------
+
+def softmax(z):
+    e = np.exp(z - z.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
+
+
+def forward(X, m, train=False, keep=0.9):
+    cache = {"A0": X}
+    A = X
+    for i in range(1, len(SIZES) - 1):
+        Z = A @ m[f"W{i}"] + m[f"b{i}"]
+        A = np.maximum(0.01 * Z, Z)
+        if train:
+            mask = (np.random.random(A.shape) < keep) / keep
+            A *= mask
+            cache[f"D{i}"] = mask
+        cache[f"Z{i}"], cache[f"A{i}"] = Z, A
+    last = len(SIZES) - 1
+    cache["P"] = softmax(A @ m[f"W{last}"] + m[f"b{last}"])
+    return cache
+
+
+def loss_acc(P, y):
+    return (
+        float(-np.mean(np.sum(y * np.log(P + 1e-9), axis=1))),
+        float(np.mean(P.argmax(1) == y.argmax(1)) * 100),
+    )
+
+
+def adam_step(m, grads, lr):
+    m["t"] += 1
+    for k, g in grads.items():
+        m["m"][k] = 0.9 * m["m"].get(k, 0) + 0.1 * g
+        m["v"][k] = 0.999 * m["v"].get(k, 0) + 0.001 * (g * g)
+        mh = m["m"][k] / (1 - 0.9 ** m["t"])
+        vh = m["v"][k] / (1 - 0.999 ** m["t"])
+        m[k] -= lr * mh / (np.sqrt(vh) + 1e-8)
+
+
+def backprop(batch_X, batch_y, m):
+    c = forward(batch_X, m, train=True)
+    dz, grads = (c["P"] - batch_y) / len(batch_X), {}
+    for i in range(len(SIZES) - 1, 0, -1):
+        grads[f"W{i}"] = c[f"A{i-1}"].T @ dz
+        grads[f"b{i}"] = dz.sum(0)
+        if i > 1:
+            dz = (dz @ m[f"W{i}"].T) * np.where(c[f"Z{i-1}"] > 0, 1, 0.01)
+            if f"D{i-1}" in c:
+                dz *= c[f"D{i-1}"]
+    return grads
+
+
+# -------------------------- training and evaluation --------------------------
+
+def evaluate(X, y, m):
+    if len(X) == 0:
+        return {"loss": None, "acc": None, "confusion": np.zeros((10, 10), dtype=int), "per_digit": {}}
+    P = forward(X, m)["P"]
+    loss, acc = loss_acc(P, y)
+    truth, pred = y.argmax(1), P.argmax(1)
+    confusion = np.zeros((10, 10), dtype=int)
+    for t, p in zip(truth, pred):
+        confusion[int(t), int(p)] += 1
+    per_digit = {
+        str(d): (None if confusion[d].sum() == 0 else float(confusion[d, d] / confusion[d].sum() * 100))
+        for d in DIGITS
+    }
+    return {"loss": loss, "acc": acc, "confusion": confusion, "per_digit": per_digit}
+
+
+def metric_payload(epoch, epochs, train_eval, val_eval, grad_norm, train_count, val_count, augmented_count):
+    return {
+        "epoch": epoch,
+        "epochs": epochs,
+        "train_loss": train_eval["loss"],
+        "train_acc": train_eval["acc"],
+        "val_loss": val_eval["loss"],
+        "val_acc": val_eval["acc"],
+        "grad": grad_norm,
+        "dataset_size": len(X_data),
+        "train_size": train_count,
+        "val_size": val_count,
+        "augmented": augmented_count,
+        "stats": dataset_stats(),
+    }
+
+
+def train_stream(mode="scratch", epochs=160, lr=0.001, batch=32, patience=18):
+    global model
+    stats = dataset_stats()
+    if len(X_data) == 0:
+        yield json.dumps({"error": "No data to train on!", "stats": stats}) + "\n"
+        return
+
+    split = split_dataset()
+    if len(split["train"]) == 0:
+        yield json.dumps({"error": "Training set is empty after validation split.", "stats": stats}) + "\n"
+        return
+
+    if mode == "scratch" or not model_matches_architecture(model):
+        model = fresh_model()
+
+    X = np.asarray(X_data, dtype=float)
+    y = np.asarray(y_data, dtype=float)
+    train_X, train_y = X[split["train"]], y[split["train"]]
+    val_X, val_y = X[split["val"]], y[split["val"]]
+    aug_X, aug_y = augment_training_data(train_X, train_y)
+    rng, best, stale, last_grads = np.random.default_rng(), float("inf"), 0, {}
+
+    for epoch in range(1, epochs + 1):
+        order = rng.permutation(len(aug_X))
+        for start in range(0, len(aug_X), batch):
+            ids = order[start : start + batch]
+            last_grads = backprop(aug_X[ids], aug_y[ids], model)
+            adam_step(model, last_grads, lr)
+
+        train_eval = evaluate(train_X, train_y, model)
+        val_eval = evaluate(val_X, val_y, model)
+        grad_norm = float(np.sqrt(sum(np.sum(g * g) for g in last_grads.values())))
+        payload = metric_payload(epoch, epochs, train_eval, val_eval, grad_norm, len(train_X), len(val_X), len(aug_X))
+        yield json.dumps(payload) + "\n"
+
+        monitor = val_eval["loss"] if val_eval["loss"] is not None else train_eval["loss"]
+        if monitor + 1e-4 < best:
+            best, stale = monitor, 0
+        else:
+            stale += 1
+        if len(val_X) and stale >= patience:
+            payload["early_stop"] = True
+            payload["msg"] = f"Early stopping: validation loss did not improve for {patience} epochs."
+            yield json.dumps(payload) + "\n"
+            break
+        time.sleep(0.02)
+
+    final_train = evaluate(train_X, train_y, model)
+    final_val = evaluate(val_X, val_y, model)
+    save_state()
+    yield json.dumps({
+        "done": True,
+        "msg": "Training complete.",
+        "train": {
+            "loss": final_train["loss"],
+            "acc": final_train["acc"],
+            "per_digit": final_train["per_digit"],
+        },
+        "validation": {
+            "loss": final_val["loss"],
+            "acc": final_val["acc"],
+            "confusion": final_val["confusion"].tolist(),
+            "per_digit": final_val["per_digit"],
+        },
+        "stats": dataset_stats(),
+    }) + "\n"
+
+
+# ------------------------------- inference -------------------------------
+
+def predict(pixels):
+    probs = forward(center_pixels(pixels).reshape(1, -1), model)["P"][0]
+    top = sorted(((i, float(p * 100)) for i, p in enumerate(probs)), key=lambda x: x[1], reverse=True)[:3]
+    return {"top3": [{"digit": d, "conf": c} for d, c in top], "probs": [float(x * 100) for x in probs]}
+
+
+# ----------------------------------- UI -----------------------------------
+
+HTML = """
+<!doctype html>
+<title>Digit AI Trainer</title>
+<h1>Digit AI Drawer</h1>
+<div id="warnings"></div>
+<p>Drawings saved: <b id="count">{{ count }}</b></p>
+<div id="classCounts"></div>
+
+<canvas id="canvas" width="28" height="28"></canvas><br><br>
+<button onclick="clearCanvas()">Clear Canvas</button>
+
+<h3>Step 1: Teach the AI</h3>
+<label>What number is this?</label>
+<input id="label" type="number" min="0" max="9" style="width:50px">
+<button onclick="teach()">Save Drawing</button>
+<button onclick="deleteLast()">Delete Last Sample</button><br><br>
+<input id="files" type="file" accept="image/*" multiple>
+<button onclick="uploadTeach()">Upload & Save</button>
+
+<h3>Dataset</h3>
+<button onclick="refreshStats()">Refresh Stats</button>
+<input id="deleteIndex" type="number" min="0" placeholder="sample index">
+<button onclick="deleteIndex()">Delete Sample</button>
+<button onclick="exportData()">Export JSON</button>
+<input id="importFile" type="file" accept="application/json">
+<button onclick="importData()">Import JSON</button>
+<button onclick="clearDataset()">Clear All Samples</button>
+
+<h3>Step 2: Train</h3>
+<button onclick="train('further')">Train Further</button>
+<button onclick="train('scratch')">Train From Scratch</button>
+<p id="stats">Idle</p>
+<canvas id="graph" width="860" height="360"></canvas>
+
+<h3>Evaluation</h3>
+<div id="confusion"></div>
+
+<h3>Step 3: Guess</h3>
+<button onclick="guess()">MAKE AI GUESS</button>
+<input id="guessFile" type="file" accept="image/*">
+<button onclick="uploadGuess()">Upload & Guess</button>
+<h2 id="out"></h2>
+<pre id="probs"></pre>
+
+<style>
+body{font-family:Arial,sans-serif;margin:30px}
+#warnings{background:#fff3cd;border:1px solid #e5c35b;padding:8px;margin:8px 0;display:none}
+#canvas{width:280px;height:280px;border:2px solid black;background:white;image-rendering:pixelated;background-image:linear-gradient(to right,#ddd 1px,transparent 1px),linear-gradient(to bottom,#ddd 1px,transparent 1px);background-size:10px 10px}
+#graph{border:1px solid #999;background:#fff;max-width:100%;height:auto}
+button,input{margin:4px;padding:6px}
+#out{color:blue}
+table{border-collapse:collapse;margin-top:8px}td,th{border:1px solid #aaa;padding:4px 7px;text-align:center}
+.bad{background:#ffd9d9}.good{background:#ddf4dd}
+</style>
+
+<script>
+const $=id=>document.getElementById(id), canvas=$("canvas"), ctx=canvas.getContext("2d"), out=$("out");
+const graph=$("graph"), g=graph.getContext("2d"); let history=[];
+function clearCanvas(){ctx.clearRect(0,0,28,28);out.textContent="";$("probs").textContent=""}
+function draw(e){const r=canvas.getBoundingClientRect(),p=e.touches?e.touches[0]:e;ctx.fillStyle="black";ctx.fillRect(Math.floor((p.clientX-r.left)/10),Math.floor((p.clientY-r.top)/10),1,1);e.preventDefault()}
+canvas.onmousemove=e=>{if(e.buttons)draw(e)};canvas.ontouchmove=draw;
+function pixels(){const d=ctx.getImageData(0,0,28,28).data;return Array.from({length:784},(_,i)=>d[i*4+3]?1:0)}
+async function post(url,body={}){return fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(r=>r.json())}
+function show(d){$("probs").textContent=(d.top3||[]).map(x=>`${x.digit} : ${x.conf.toFixed(1)}%`).join("\\n");out.textContent=d.top3?`Top guess: ${d.top3[0].digit}`:d.msg}
+function applyStats(s){$("count").textContent=s.size;$("classCounts").textContent="Class counts: "+Object.entries(s.counts).map(([d,n])=>`${d}:${n}`).join("  ");$("warnings").style.display=s.warnings.length?"block":"none";$("warnings").innerHTML=s.warnings.join("<br>")}
+async function refreshStats(){applyStats(await fetch("/stats").then(r=>r.json()))}
+async function teach(){if(!$("label").value)return alert("Type a number first!");let d=await post("/teach",{label:$("label").value,pixels:pixels()});applyStats(d.stats);clearCanvas()}
+async function guess(){show(await post("/guess",{pixels:pixels()}))}
+async function upload(url,id,label){const form=new FormData(),files=$(id).files;if(!files.length)return alert("Choose image file(s)!");if(label)form.append("label",label);[...files].forEach(f=>form.append("files",f));return fetch(url,{method:"POST",body:form}).then(r=>r.json())}
+async function uploadTeach(){if(!$("label").value)return alert("Type a number first!");let d=await upload("/teach_upload","files",$("label").value);applyStats(d.stats);out.textContent=d.msg}
+async function uploadGuess(){show(await upload("/guess_upload","guessFile"))}
+async function deleteLast(){let d=await post("/delete_sample",{index:-1});applyStats(d.stats);out.textContent=d.msg}
+async function deleteIndex(){if($("deleteIndex").value==="")return alert("Type a sample index first!");let d=await post("/delete_sample",{index:Number($("deleteIndex").value)});applyStats(d.stats);out.textContent=d.msg}
+async function clearDataset(){if(confirm("Clear all samples?")){let d=await post("/clear_dataset");applyStats(d.stats);out.textContent=d.msg;$("confusion").innerHTML=""}}
+function exportData(){location.href="/export_dataset"}
+async function importData(){const f=$("importFile").files[0];if(!f)return alert("Choose JSON first!");const d=await fetch("/import_dataset",{method:"POST",body:f}).then(r=>r.json());applyStats(d.stats);out.textContent=d.msg}
+function pct(v){return v==null?"n/a":v.toFixed(1)+"%"} function num(v){return v==null?"n/a":v.toFixed(4)}
+
+function drawGraph(){
+  const W=860,H=360,L=64,R=76,T=34,B=48,PW=W-L-R,PH=H-T-B;
+  g.clearRect(0,0,W,H);g.fillStyle="#fff";g.fillRect(0,0,W,H);g.font="12px Arial";g.lineWidth=1;
+  const maxLoss=Math.max(1,...history.flatMap(x=>[x.train_loss||0,x.val_loss||0]));
+  const maxGrad=Math.max(1,...history.map(x=>x.grad||0));
+  const xAt=i=>L+(history.length<2?0:i/(history.length-1))*PW;
+  const yPct=v=>T+PH-(v||0)/100*PH, yLoss=v=>T+PH-(v||0)/maxLoss*PH, yGrad=v=>T+PH-(v||0)/maxGrad*PH;
+  g.strokeStyle="#e5e5e5";g.fillStyle="#555";
+  for(let i=0;i<=5;i++){let y=T+i*PH/5;g.beginPath();g.moveTo(L,y);g.lineTo(W-R,y);g.stroke();g.textAlign="right";g.fillText((100-i*20)+"%",L-8,y+4);g.textAlign="left";g.fillText((maxLoss-i*maxLoss/5).toFixed(2),W-R+8,y+4)}
+  g.strokeStyle="#bbb";g.strokeRect(L,T,PW,PH);g.fillStyle="#333";g.textAlign="left";g.fillText("accuracy / gradient",8,18);g.textAlign="right";g.fillText("loss",W-12,18);g.textAlign="center";g.fillText("epoch",L+PW/2,H-12);
+  for(let i=0;i<Math.min(8,history.length||1);i++){let n=history.length<2?0:Math.round(i*(history.length-1)/(Math.min(8,history.length)-1)),x=xAt(n);g.fillText(history[n]?.epoch||0,x,T+PH+20)}
+  if(history.length<2){g.fillStyle="#777";g.fillText("Start training to draw live metrics",W/2,H/2);return}
+  function line(color,yFn,key,dash=[]){g.strokeStyle=color;g.setLineDash(dash);g.lineWidth=2;g.beginPath();history.forEach((p,i)=>{let x=xAt(i),y=yFn(p[key]);i?g.lineTo(x,y):g.moveTo(x,y)});g.stroke();g.setLineDash([])}
+  line("#178a35",yPct,"train_acc");line("#0b5cad",yPct,"val_acc",[5,4]);line("#d22",yLoss,"train_loss");line("#9b2fae",yLoss,"val_loss",[5,4]);line("#f08a00",yGrad,"grad");
+  const last=history.at(-1);g.fillStyle="#fff";g.fillRect(L+10,T+8,310,86);g.strokeStyle="#ccc";g.strokeRect(L+10,T+8,310,86);g.textAlign="left";
+  [["train acc","#178a35",pct(last.train_acc)],["val acc","#0b5cad",pct(last.val_acc)],["train loss","#d22",num(last.train_loss)],["val loss","#9b2fae",num(last.val_loss)],["grad","#f08a00",last.grad.toFixed(3)]].forEach((r,i)=>{g.fillStyle=r[1];g.fillText(`${r[0]} ${r[2]}`,L+22,T+28+i*14)})
+}
+
+function showConfusion(data){
+  if(!data.validation)return;
+  let c=data.validation.confusion, per=data.validation.per_digit, html="<table><tr><th>true / pred</th>"+[0,1,2,3,4,5,6,7,8,9].map(d=>`<th>${d}</th>`).join("")+"<th>accuracy</th></tr>";
+  c.forEach((row,i)=>{html+=`<tr><th>${i}</th>`+row.map((n,j)=>`<td class="${i==j&&n?'good':n?'bad':''}">${n}</td>`).join("")+`<td>${per[i]==null?"n/a":per[i].toFixed(1)+"%"}</td></tr>`});
+  $("confusion").innerHTML=html+"</table>";
+}
+
+async function train(mode){
+  history=[];$("stats").textContent="Training...";$("confusion").innerHTML="";drawGraph();
+  const res=await fetch("/train_stream",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode})});
+  const reader=res.body.getReader(),dec=new TextDecoder();let buf="";
+  while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});
+    for(const line of buf.split("\\n").slice(0,-1)){const d=JSON.parse(line);if(d.stats)applyStats(d.stats);if(d.error){$("stats").textContent=d.error;return}
+      if(d.done){$("stats").textContent=d.msg;showConfusion(d);return}
+      history.push(d);$("stats").textContent=`Epoch ${d.epoch}/${d.epochs} | train ${pct(d.train_acc)} loss ${num(d.train_loss)} | val ${pct(d.val_acc)} loss ${num(d.val_loss)} | grad ${d.grad.toFixed(3)} | data ${d.dataset_size} (${d.train_size} train / ${d.val_size} val)`;drawGraph();
+    }buf=buf.slice(buf.lastIndexOf("\\n")+1)}
+}
+refreshStats();drawGraph();
+</script>
+"""
+
+
+# ---------------------------------- routes ----------------------------------
+
+@app.get("/")
+def home():
+    return render_template_string(HTML, count=len(X_data))
+
+
+@app.get("/stats")
+def stats_route():
+    return jsonify(dataset_stats())
+
+
+@app.post("/teach")
+def teach():
+    X_data.append(center_pixels(request.json["pixels"]))
+    y_data.append(one_hot(request.json["label"]))
+    save_state()
+    return jsonify(stats=dataset_stats())
+
+
+@app.post("/guess")
+def guess():
+    return jsonify(predict(request.json["pixels"]))
+
+
+@app.post("/train_stream")
+def train_route():
+    data = request.get_json(silent=True) or {}
+    return Response(train_stream(mode=data.get("mode", "scratch")), mimetype="application/x-ndjson")
+
+
+@app.post("/teach_upload")
+def teach_upload():
+    label, files = request.form.get("label"), request.files.getlist("files")
+    if label is None or not label.isdigit() or not 0 <= int(label) <= 9:
+        return jsonify(msg="Label must be 0-9.", stats=dataset_stats()), 400
+    for f in files:
+        X_data.append(image_to_pixels(f.read()))
+        y_data.append(one_hot(label))
+    save_state()
+    return jsonify(msg=f"Added {len(files)} image(s) as {label}.", stats=dataset_stats())
+
+
+@app.post("/guess_upload")
+def guess_upload():
+    files = request.files.getlist("files")
+    return jsonify(predict(image_to_pixels(files[0].read())) if files else {"msg": "No file received."})
+
+
+@app.post("/delete_sample")
+def delete_sample():
+    if not X_data:
+        return jsonify(msg="No samples to delete.", stats=dataset_stats())
+    idx = int((request.json or {}).get("index", -1))
+    idx = len(X_data) - 1 if idx == -1 else idx
+    if 0 <= idx < len(X_data):
+        del X_data[idx]
+        del y_data[idx]
+        save_state()
+        return jsonify(msg=f"Deleted sample {idx}.", stats=dataset_stats())
+    return jsonify(msg="Sample index out of range.", stats=dataset_stats()), 400
+
+
+@app.post("/clear_dataset")
+def clear_dataset():
+    X_data.clear()
+    y_data.clear()
+    save_state()
+    return jsonify(msg="All samples cleared.", stats=dataset_stats())
+
+
+@app.get("/export_dataset")
+def export_dataset():
+    samples = [{"label": label, "pixels": np.asarray(x, dtype=float).round(4).tolist()} for x, label in zip(X_data, labels())]
+    return Response(json.dumps({"samples": samples}), mimetype="application/json",
+                    headers={"Content-Disposition": "attachment; filename=digit_dataset.json"})
+
+
+@app.post("/import_dataset")
+def import_dataset():
+    raw = request.get_data()
+    data = json.loads(raw.decode("utf-8"))
+    samples = data.get("samples", [])
+    X_data.clear()
+    y_data.clear()
+    for sample in samples:
+        X_data.append(center_pixels(sample["pixels"]))
+        y_data.append(one_hot(sample["label"]))
+    save_state()
+    return jsonify(msg=f"Imported {len(samples)} samples.", stats=dataset_stats())
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, threaded=True)
